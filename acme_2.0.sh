@@ -5,7 +5,7 @@ set -e
 trap 'echo "脚本执行出错，请检查！"; exit 1' ERR
 
 # 日志文件路径
-LOGFILE="/var/log/ssl_script.log"
+LOGFILE="/var/log/renew_cert.log"
 exec > >(tee -a $LOGFILE) 2>&1
 echo "==== 开始执行脚本 $(date) ===="
 
@@ -47,60 +47,18 @@ case $CA_OPTION in
     *) echo "无效选项"; exit 1 ;;
 esac
 
-# 提示用户是否关闭防火墙
-echo "是否关闭防火墙？"
-echo "1) 是"
-echo "2) 否"
-read -p "输入选项 (1 或 2): " FIREWALL_OPTION
-
-# 如果用户选择不关闭防火墙，提示是否放行端口
-if [ "$FIREWALL_OPTION" -eq 2 ]; then
-    echo "是否放行特定端口？"
-    echo "1) 是"
-    echo "2) 否"
-    read -p "输入选项 (1 或 2): " PORT_OPTION
-
-    if [ "$PORT_OPTION" -eq 1 ]; then
-        read -p "请输入要放行的端口号: " PORT
-        if [[ ! "$PORT" =~ ^[0-9]+$ ]]; then
-            echo "无效的端口号，请输入数字！"
-            exit 1
-        fi
-    fi
-fi
-
-# 安装依赖项、配置防火墙
+# 安装依赖项
 case $OS in
     ubuntu|debian)
         sudo apt update
         sudo apt upgrade -y
         sudo apt install -y curl socat git cron
-        if [ "$FIREWALL_OPTION" -eq 1 ]; then
-            if command -v ufw >/dev/null 2>&1; then
-                sudo ufw disable || echo "UFW 已关闭"
-            else
-                echo "未检测到 UFW，跳过防火墙操作。"
-            fi
-        elif [ "$PORT_OPTION" -eq 1 ]; then
-            if command -v ufw >/dev/null 2>&1; then
-                sudo ufw allow $PORT || echo "端口 $PORT 已放行"
-            else
-                echo "未检测到 UFW，无法放行端口。"
-            fi
-        fi
         ;;
     centos)
         sudo yum update -y
         sudo yum install -y curl socat git cronie
         sudo systemctl start crond
         sudo systemctl enable crond
-        if [ "$FIREWALL_OPTION" -eq 1 ]; then
-            sudo systemctl stop firewalld || echo "Firewalld 已关闭"
-            sudo systemctl disable firewalld
-        elif [ "$PORT_OPTION" -eq 1 ]; then
-            sudo firewall-cmd --permanent --add-port=${PORT}/tcp || echo "端口 $PORT 已放行"
-            sudo firewall-cmd --reload
-        fi
         ;;
     *)
         echo "不支持的操作系统：$OS"
@@ -111,16 +69,35 @@ esac
 # 安装 acme.sh
 curl https://get.acme.sh | sh
 
-# 使 acme.sh 脚本可用
+# 设置 acme.sh 路径并验证安装
 export PATH="$HOME/.acme.sh:$PATH"
-chmod +x "$HOME/.acme.sh/acme.sh"
+echo "当前 PATH 路径: $PATH"
+
+# 检查 acme.sh 是否存在
+if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
+    echo "acme.sh 安装失败，请检查错误！" >> $LOGFILE
+    exit 1
+fi
 
 # 注册帐户
 ~/.acme.sh/acme.sh --register-account -m $EMAIL --server $CA_SERVER
 
-# 申请 SSL 证书
-if ! ~/.acme.sh/acme.sh --issue --standalone -d $DOMAIN --server $CA_SERVER; then
-    echo "证书申请失败，删除已生成的文件和文件夹。"
+# 如果 nginx 在运行，停止它
+if systemctl is-active --quiet nginx; then
+    echo "nginx 服务正在运行，正在停止 nginx..."
+    sudo systemctl stop nginx
+else
+    echo "nginx 服务未运行，无需停止。"
+fi
+
+# 删除旧证书文件（如果存在）
+echo "删除旧证书文件（如果有）..."
+rm -rf /root/.acme.sh/$DOMAIN_ecc
+rm -f /etc/v2ray/server.key /etc/v2ray/server.crt
+
+# 强制申请 SSL 证书
+if ! ~/.acme.sh/acme.sh --issue --standalone -d $DOMAIN --server $CA_SERVER --force; then
+    echo "证书申请失败，删除已生成的文件和文件夹。" >> $LOGFILE
     rm -f /etc/v2ray/server.key /etc/v2ray/server.crt
     ~/.acme.sh/acme.sh --remove -d $DOMAIN
     exit 1
@@ -135,6 +112,14 @@ fi
 chmod 600 /etc/v2ray/server.key
 chmod 644 /etc/v2ray/server.crt
 
+# 重新启动 nginx
+if systemctl is-active --quiet nginx; then
+    echo "nginx 服务正在运行，正在重新启动 nginx..."
+    sudo systemctl start nginx
+else
+    echo "nginx 服务未运行，无需重新启动。"
+fi
+
 echo "SSL证书和私钥已生成:"
 echo "证书: /etc/v2ray/server.crt"
 echo "私钥: /etc/v2ray/server.key"
@@ -143,11 +128,22 @@ echo "私钥: /etc/v2ray/server.key"
 cat << EOF > /root/renew_cert.sh
 #!/bin/bash
 export PATH="\$HOME/.acme.sh:\$PATH"
-~/.acme.sh/acme.sh --renew -d $DOMAIN --server $CA_SERVER > /var/log/renew_cert.log 2>&1
+
+# 获取证书的剩余有效期
+REMAINING_DAYS=\$(~/.acme.sh/acme.sh --info -d $DOMAIN | grep "Valid till" | awk '{print \$4}')
+
+# 如果剩余有效期大于30天，不进行续期
+if [ "\$REMAINING_DAYS" -gt 30 ]; then
+    echo "证书剩余有效期大于30天，跳过续期：\$REMAINING_DAYS 天" >> $LOGFILE
+    exit 0
+fi
+
+# 否则，进行续期
+~/.acme.sh/acme.sh --renew -d $DOMAIN --server $CA_SERVER >> $LOGFILE 2>&1
 if [ \$? -eq 0 ]; then
-    echo "证书续期成功: \$(date)" >> /var/log/renew_cert.log
+    echo "证书续期成功: \$(date)" >> $LOGFILE
 else
-    echo "证书续期失败: \$(date)" >> /var/log/renew_cert.log
+    echo "证书续期失败: \$(date)" >> $LOGFILE
 fi
 EOF
 
@@ -156,4 +152,4 @@ chmod +x /root/renew_cert.sh
 # 创建自动续期任务
 (crontab -l 2>/dev/null; echo "0 0 * * * /root/renew_cert.sh") | crontab -
 
-echo "自动续期任务已添加，脚本执行完成！"
+echo "自动续期任务已添加，脚本执行完成！" >> $LOGFILE
