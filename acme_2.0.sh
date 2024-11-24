@@ -133,8 +133,85 @@ echo "私钥: /root/${DOMAIN}.key"
 # 创建自动续期的脚本
 cat << EOF > /root/renew_cert.sh
 #!/bin/bash
-export PATH="\$HOME/.acme.sh:\$PATH"
-acme.sh --renew -d $DOMAIN --server $CA_SERVER
+
+# 设置 acme.sh 的路径
+export PATH="$HOME/.acme.sh:$PATH"
+
+# 设置日志文件路径
+LOGFILE="/var/log/renew_cert.log"
+
+# 获取当前时间的时间戳
+CURRENT_TIME_STR=$(date "+%Y-%m-%d %H:%M:%S")
+
+# 获取证书的信息
+CERT_INFO=$(/root/.acme.sh/acme.sh --info -d www.www.www)
+
+# 检查获取到的证书信息
+if [ -z "$CERT_INFO" ]; then
+    echo "$CURRENT_TIME_STR - 未能获取证书的信息，请检查 acme.sh 是否正确安装和配置。" >> $LOGFILE
+    exit 1
+fi
+
+# 提取下次续期时间（ISO 8601 格式）
+NEXT_RENEW_TIME_STR=$(echo "$CERT_INFO" | grep "Le_NextRenewTimeStr" | awk -F "=" '{print $2}' | tr -d '[:space:]')
+
+# 检查是否成功提取下次续期时间
+if [ -z "$NEXT_RENEW_TIME_STR" ]; then
+    echo "$CURRENT_TIME_STR - 未能解析证书的续期时间，请检查证书信息。" >> $LOGFILE
+    echo "$CURRENT_TIME_STR - 证书信息:" >> $LOGFILE
+    echo "$CERT_INFO" >> $LOGFILE
+    exit 1
+fi
+
+# 将续期时间从 ISO 8601 格式转换为 Unix 时间戳
+NEXT_RENEW_TIME=$(date --date="${NEXT_RENEW_TIME_STR}" +%s 2>/dev/null)
+
+# 如果上面的转换失败，手动替换 'T' 和 'Z' 格式
+if [ -z "$NEXT_RENEW_TIME" ]; then
+    NEXT_RENEW_TIME=$(date --date="${NEXT_RENEW_TIME_STR//T/ }" +%s 2>/dev/null)
+fi
+
+# 如果转换还是失败，退出
+if [ -z "$NEXT_RENEW_TIME" ]; then
+    echo "$CURRENT_TIME_STR - 无法解析续期时间，格式不正确或系统不支持该格式。" >> $LOGFILE
+    exit 1
+fi
+
+# 获取当前时间的 Unix 时间戳
+CURRENT_TIME=$(date +%s)
+
+# 如果下次续期时间距离现在超过 30 天，不进行续期
+if [ "$NEXT_RENEW_TIME" -gt "$((CURRENT_TIME + 2592000))" ]; then
+    echo "$CURRENT_TIME_STR - 证书剩余有效期大于30天，跳过续期。" >> $LOGFILE
+    exit 0
+fi
+
+# 停止 nginx 服务
+if systemctl is-active --quiet nginx; then
+    echo "$CURRENT_TIME_STR - nginx 服务正在运行，正在停止 nginx..." >> $LOGFILE
+    sudo systemctl stop nginx
+else
+    echo "$CURRENT_TIME_STR - nginx 服务未运行，开始更新证书" >> $LOGFILE
+fi
+
+# 否则，进行续期
+echo "$CURRENT_TIME_STR - 证书剩余有效期小于30天，正在续期..." >> $LOGFILE
+/root/.acme.sh/acme.sh --renew -d hk.hankingv.top --server zerossl --force >> $LOGFILE 2>&1
+
+# 检查续期是否成功
+if [ $? -eq 0 ]; then
+    echo "$CURRENT_TIME_STR - 证书续期成功" >> $LOGFILE
+else
+    echo "$CURRENT_TIME_STR - 证书续期失败" >> $LOGFILE
+fi
+
+# 重新启动 nginx 服务
+if ! systemctl is-active --quiet nginx; then
+    echo "$CURRENT_TIME_STR - nginx 服务未运行，正在启动 nginx..." >> $LOGFILE
+    sudo systemctl start nginx
+else
+    echo "$CURRENT_TIME_STR - nginx 服务已在运行。" >> $LOGFILE
+fi
 EOF
 chmod +x /root/renew_cert.sh
 
