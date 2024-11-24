@@ -121,23 +121,23 @@ chmod +x "$HOME/.acme.sh/acme.sh"
 # 申请 SSL 证书
 if ! ~/.acme.sh/acme.sh --issue --standalone -d $DOMAIN --server $CA_SERVER; then
     echo "证书申请失败，删除已生成的文件和文件夹。"
-    rm -f /root/${DOMAIN}.key /root/${DOMAIN}.crt
+    rm -f /etc/v2ray/server.key /etc/v2ray/server.crt
     ~/.acme.sh/acme.sh --remove -d $DOMAIN
     exit 1
 fi
 
 # 安装 SSL 证书
 ~/.acme.sh/acme.sh --installcert -d $DOMAIN \
-    --key-file       /root/${DOMAIN}.key \
-    --fullchain-file /root/${DOMAIN}.crt
+    --key-file       /etc/v2ray/server.key \
+    --fullchain-file /etc/v2ray/server.crt
 
 # 设置权限
-chmod 600 /root/${DOMAIN}.key
-chmod 644 /root/${DOMAIN}.crt
+chmod 600 /etc/v2ray/server.key
+chmod 644 /etc/v2ray/server.crt
 
 echo "SSL证书和私钥已生成:"
-echo "证书: /root/${DOMAIN}.crt"
-echo "私钥: /root/${DOMAIN}.key"
+echo "证书: /etc/v2ray/server.crt"
+echo "私钥: /etc/v2ray/server.key"
 
 # 创建自动续期脚本
 cat << EOF > /root/renew_cert.sh
